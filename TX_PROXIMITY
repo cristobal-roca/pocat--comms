@@ -1,0 +1,146 @@
+//Tx_proximity.c
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "apps_common.h"
+#include "apps_utilities.h"
+#include "lr11xx_radio.h"
+#include "lr11xx_regmem.h"
+#include "smtc_hal_dbg_trace.h"
+#include "uart_init.h"
+
+
+#include "protocol_definitions.h"// SDUFrame, PDU IDs, sizes
+#include "frame_sublayer.h"      // serialize_sdu_frame(), deserialize_sdu_frame()
+#include "io_sublayer.h"        // segment_sdu(), create_unfragmented_sdu(), 
+
+static lr11xx_hal_context_t* context;
+static void send_payload_autofrag(lr11xx_hal_context_t *context, const uint8_t *payload, size_t payload_len);
+
+int main(void)
+{
+    /* Init MCU, shield, UART */
+    smtc_hal_mcu_init();
+    apps_common_shield_init();
+    uart_init();
+
+    HAL_DBG_TRACE_INFO("===== LR11xx TX PROXIMITY-1 PACKETS example =====\n\n");
+    apps_common_print_sdk_driver_version();
+
+    /* Init LR11xx context and radio */
+    context = apps_common_lr11xx_get_context();
+    apps_common_lr11xx_system_init((void*) context);
+    apps_common_lr11xx_fetch_and_print_version((void*) context);
+    apps_common_lr11xx_radio_init((void*) context);
+
+    /* Example payload to send */
+    const uint8_t payload[] = "Hello from TX node FROM NANOSATLAB";
+   
+  
+   
+    const size_t payload_len = sizeof(payload) - 1;
+    HAL_DBG_TRACE_INFO("Full payload to send (len=%d): %s\n", (int)payload_len, payload);
+    // HAL_DBG_TRACE_INFO("Prepared payload to send (len=%d): %s\n", (int)payload_len, payload);
+    HAL_DBG_TRACE_INFO("Prepared payload to send (len=%d bytes, will fragment into 3 segments)\n", (int)payload_len);
+
+    /* Optionally sleep or loop to send periodically */
+    while (1) {
+        /* Send payload, fragmenting automatically if necessary */
+        HAL_DBG_TRACE_INFO("Starting transmission cycle...\n");
+        send_payload_autofrag(context, payload, payload_len);
+        
+        HAL_DBG_TRACE_INFO("Transmission cycle complete. Waiting 50s...\n\n");
+        LL_mDelay(50000);
+    }
+
+    return 0;
+}
+
+//usamos un Helper: send payload with automatic fragmentation using io_sublayer helper
+static void send_payload_autofrag(lr11xx_hal_context_t *context, const uint8_t *payload, size_t payload_len)
+{
+    HAL_DBG_TRACE_INFO(">>> ENTERED send_payload_autofrag\n");
+    // Use static to avoid stack overflow (IOBuffer is ~65KB!)
+    static IOBuffer buffer;
+    create_buffer(&buffer); // Initialize by pointer - no stack copy!
+
+    HAL_DBG_TRACE_INFO("Creating SDU frame (payload_len=%d, max_unfrag=%d)...\n", (int)payload_len, MAX_UNFRAGMENTED_SDU_SIZE);
+    
+    if (payload_len <= MAX_UNFRAGMENTED_SDU_SIZE) {
+        // Create and enqueue an unfragmented SDU
+        create_unfragmented_sdu((uint8_t*)payload, payload_len, 0 /*PortID*/, PDU_DATA, 0x0100 /*SC_ID*/, 0 /*SD_ID*/, &buffer);
+        HAL_DBG_TRACE_INFO("Created unfragmented SDU\n");
+    } else {
+        // Create fragmented SDUs and append to buffer
+        segment_sdu((uint8_t*)payload, payload_len, 0 /*PortID*/, PDU_DATA, 0x0100 /*SC_ID*/, 0 /*SD_ID*/, &buffer);
+        HAL_DBG_TRACE_INFO("Created fragmented SDUs\n");
+    }
+
+    // Find the packet id we just created (should be the first in a fresh buffer)
+    uint32_t packet_id = get_first_packet_id(&buffer);
+        HAL_DBG_TRACE_INFO("Packet ID: 0x%08X\n", (unsigned int)packet_id);
+    
+    if (packet_id == UINT32_MAX) {
+        HAL_DBG_TRACE_INFO("Error: no packet id found for payload\n");
+        return;
+    }
+
+    // Get frames to send from next sublayer
+    size_t frames_count = 0;
+    SDUFrame *frames_to_send = send_to_next_sublayer(&buffer, packet_id, &frames_count);
+    HAL_DBG_TRACE_INFO("send_to_next_sublayer returned %d frames\n", (int)frames_count);
+    if (frames_to_send == NULL || frames_count == 0) {
+        HAL_DBG_TRACE_INFO("Error: send_to_next_sublayer returned NULL or zero count\n");
+        return;
+    }
+
+    // Use send_to_LoRa which serializes using static buffer (no malloc in TX loop)
+    SDUFrame *multip = frames_to_send;
+    int mul_count = (int)frames_count;
+    HAL_DBG_TRACE_INFO("Starting transmission loop (%d segments)...\n", mul_count);
+    while (mul_count > 0) {
+        HAL_DBG_TRACE_INFO("Calling send_to_LoRa (remaining: %d)...\n", mul_count);
+        SerializedData serialized = send_to_LoRa(&multip, &mul_count);
+        HAL_DBG_TRACE_INFO("send_to_LoRa returned: data=%p, length=%d\n", serialized.data, (int)serialized.length);
+        
+        if (serialized.data == NULL || serialized.length == 0) {
+            HAL_DBG_TRACE_INFO("Serialization/send failed for a segment\n");
+            break;
+        }
+
+        // Debug print
+        HAL_DBG_TRACE_INFO("Serialized segment (%d bytes): ", (int)serialized.length);
+        for (size_t b = 0; b < serialized.length; ++b) {
+            HAL_DBG_TRACE_PRINTF("%02X ", serialized.data[b]);
+        }
+        HAL_DBG_TRACE_PRINTF("\n");
+         
+        // Write to radio and TX (serialized.data points to static buffer, no free needed)
+        apps_common_lr11xx_handle_pre_tx();
+        
+        // RE LEER Update packet parameters with actual payload length for this transmission
+        lr11xx_radio_pkt_params_lora_t pkt_params = {
+            .preamble_len_in_symb = LORA_PREAMBLE_LENGTH, // lo hace el lora
+            .header_type          = LORA_PKT_LEN_MODE,
+            .pld_len_in_bytes     = (uint8_t)serialized.length,  // Dynamic length
+            .crc                  = LORA_CRC,
+            .iq                   = LORA_IQ,
+        };
+        ASSERT_LR11XX_RC( lr11xx_radio_set_lora_pkt_params(context, &pkt_params) );
+        
+        // Write the actual bytes and transmit
+        ASSERT_LR11XX_RC( lr11xx_regmem_write_buffer8(context, serialized.data, serialized.length) );
+        ASSERT_LR11XX_RC( lr11xx_radio_set_tx( context, 0 ) );
+        HAL_DBG_TRACE_INFO("Segment sent over RF (%d bytes)\n", (int)serialized.length);
+
+        // No free() needed - static buffer is reused
+
+        // Delay entre segmentos: suficiente para que RX procese y vuelva a escuchar
+        LL_mDelay(500);  // 500ms entre segmentos
+    }
+    // Clean buffer state
+    free_buffer(&buffer, packet_id);
+}
