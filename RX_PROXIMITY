@@ -1,0 +1,224 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+
+#include "apps_common.h"
+#include "apps_utilities.h"
+#include "lr11xx_radio.h"
+#include "lr11xx_system.h"
+#include "smtc_hal_dbg_trace.h"
+#include "uart_init.h"
+
+
+#include "protocol_definitions.h"   // SDUFrame
+#include "frame_sublayer.h"         // deserialize_sdu_frame(), check_sdu_frame()
+#include "io_sublayer.h"
+
+
+static lr11xx_hal_context_t* context;
+static void receive_and_process(lr11xx_hal_context_t *context);
+static void free_sdu_frame(SDUFrame* frame);
+
+// Buffer estático para reensamblado
+static SerializedData reassembly_buffer = {0};
+
+int main(void)
+{
+    smtc_hal_mcu_init();
+    apps_common_shield_init();
+    uart_init();
+
+
+    HAL_DBG_TRACE_INFO("===== LR11xx RX PROXIMITY-1 PACKETS EXAMPLE =====\n");
+    apps_common_print_sdk_driver_version();
+
+
+    context = apps_common_lr11xx_get_context();
+    apps_common_lr11xx_system_init((void*) context);
+    apps_common_lr11xx_fetch_and_print_version((void*) context);
+    apps_common_lr11xx_radio_init((void*) context);
+
+
+    while (1)
+    {
+        receive_and_process(context);
+        LL_mDelay(10);  // Delay mínimo para volver a RX rápidamente
+    }
+
+
+    return 0;
+}
+
+
+static void receive_and_process(lr11xx_hal_context_t *context)
+{
+    uint8_t rx_buffer[255];
+    uint8_t rx_size = 0;
+
+
+    apps_common_lr11xx_handle_pre_rx();
+    ASSERT_LR11XX_RC(lr11xx_radio_set_rx(context, 10000));  // RX con timeout 10s (suficiente para recibir 3 segmentos)
+
+
+    // HAL_DBG_TRACE_INFO("Waiting for incoming LoRa packet...\n");  // Comentado para no saturar UART
+
+
+    // Wait for IRQ (RX done or timeout)
+    lr11xx_system_irq_mask_t irq_mask;
+    do {
+        ASSERT_LR11XX_RC(lr11xx_system_get_irq_status(context, &irq_mask));
+    } while ((irq_mask & (LR11XX_SYSTEM_IRQ_RX_DONE | LR11XX_SYSTEM_IRQ_TIMEOUT)) == 0);
+
+    ASSERT_LR11XX_RC(lr11xx_system_clear_irq_status(context, LR11XX_SYSTEM_IRQ_ALL_MASK));
+
+    if (irq_mask & LR11XX_SYSTEM_IRQ_RX_DONE)
+    {
+        apps_common_lr11xx_handle_post_rx();
+        apps_common_lr11xx_receive(context, rx_buffer, sizeof(rx_buffer), &rx_size);
+
+
+        HAL_DBG_TRACE_INFO("RX: %d bytes | ", rx_size);
+
+
+        /* ========= DESERIALIZAR FRAME ========= */
+        SDUFrame frame = deserialize_sdu_frame(rx_buffer);
+
+
+        if (check_sdu_frame(&frame))
+        {
+            PDUHeader* hdr = NULL;
+            uint8_t* payload = NULL;
+            uint16_t length = 0;
+
+
+            /* Determinar tipo */
+            if (frame.type == FRAME_UNFRAGMENTED)
+            {
+                hdr = &frame.data.unfragmented.header;
+                payload = frame.data.unfragmented.sdu;
+                HAL_DBG_TRACE_INFO("  Type: Unfragmented\n");
+            }
+            else if (frame.type == FRAME_FRAGMENTED)
+            {
+                hdr = &frame.data.fragmented.pdu_header;
+                payload = frame.data.fragmented.sdu;
+                HAL_DBG_TRACE_PRINTF("FRAG FSN=%d Seg=%d PID=%d | ", 
+                    hdr->FSN, 
+                    frame.data.fragmented.seg_header.SegFlag,
+                    frame.data.fragmented.seg_header.PseudoPacketID);
+            }
+            else
+            {
+                HAL_DBG_TRACE_WARNING("Unknown frame type.\n");
+               
+                return;
+            }
+
+
+            /* Longitud real del SDU */
+            length = ((uint16_t)hdr->data_length_high << 8) | hdr->data_length_low;
+
+
+            /* ========= IMPRIMIR HEADER ========= */
+            HAL_DBG_TRACE_INFO("Frame header:");
+            HAL_DBG_TRACE_PRINTF("  Version: %d\n", hdr->VersionNum);
+            HAL_DBG_TRACE_PRINTF("  QoS: %d\n", hdr->QoS);
+            HAL_DBG_TRACE_PRINTF("  PDU_ID: %d\n", hdr->PDU_ID);
+            HAL_DBG_TRACE_PRINTF("  DFC_ID: %d\n", hdr->DFC_ID);
+            HAL_DBG_TRACE_PRINTF("  PortID: %d\n", hdr->PortID);
+            HAL_DBG_TRACE_PRINTF("  SD_ID: %d\n", hdr->SD_ID);
+            HAL_DBG_TRACE_PRINTF("  PC_ID: %d\n", hdr->PC_ID);
+
+
+            uint16_t scid = ((uint16_t)hdr->SC_ID_part1 << 8) | hdr->SC_ID_part2;
+            HAL_DBG_TRACE_PRINTF("  SC_ID: 0x%04X\n", scid);
+
+
+            HAL_DBG_TRACE_PRINTF("  FSN: %d\n", hdr->FSN);
+            HAL_DBG_TRACE_PRINTF("  SDU length: %d bytes\n", length);
+
+
+            /* ========= REENSAMBLADO DE FRAGMENTOS ========= */
+            if (frame.type == FRAME_FRAGMENTED)
+            {
+                // Serializar fragmento actual al buffer de reensamblado
+                serialize_to_obc(frame, &reassembly_buffer);
+                
+                HAL_DBG_TRACE_INFO("Fragment added to reassembly buffer (total: %d bytes)\n", 
+                                   (int)reassembly_buffer.length);
+                
+                // Verificar si necesitamos más segmentos
+                if (need_more_seg(frame))
+                {
+                    HAL_DBG_TRACE_INFO("Waiting for more segments...\n");
+                    free_sdu_frame(&frame);
+                    // NO hacer return - continuar en RX en el mismo ciclo del while(1)
+                }
+                else
+                {
+                    HAL_DBG_TRACE_INFO("=== REASSEMBLY COMPLETE ===\n");
+                    HAL_DBG_TRACE_INFO("Total payload size: %d bytes\n", (int)reassembly_buffer.length);
+                    
+                    // Imprimir payload completo reensamblado
+                    HAL_DBG_TRACE_INFO("Complete payload (ASCII):\n");
+                    for (size_t i = 0; i < reassembly_buffer.length; i++)
+                    {
+                        char c = reassembly_buffer.data[i];
+                        if (c >= 32 && c <= 126) // Caracteres imprimibles
+                            HAL_DBG_TRACE_PRINTF("%c", c);
+                        else
+                            HAL_DBG_TRACE_PRINTF(".");
+                    }
+                    HAL_DBG_TRACE_PRINTF("\n\n");
+                    
+                    // Limpiar buffer de reensamblado
+                    memset(reassembly_buffer.data, 0, sizeof(reassembly_buffer.data));
+                    reassembly_buffer.length = 0;
+                }
+            }
+            else
+            {
+                /* ========= PAYLOAD UNFRAGMENTED ========= */
+                if (payload != NULL && length > 0)
+                {
+                    HAL_DBG_TRACE_INFO("Payload (ASCII):\n");
+                    for (int j = 0; j < length; j++)
+                    {
+                        char c = payload[j];
+                        if (c >= 32 && c <= 126)
+                            HAL_DBG_TRACE_PRINTF("%c", c);
+                        else
+                            HAL_DBG_TRACE_PRINTF(".");
+                    }
+                    HAL_DBG_TRACE_PRINTF("\n");
+                }
+            }
+            
+            free_sdu_frame(&frame);
+        }
+        else
+        {
+            HAL_DBG_TRACE_WARNING("Received frame is invalid or corrupted.\n");
+        }
+    }
+    else
+    {
+        HAL_DBG_TRACE_INFO("RX timeout: no packet received.\n");
+    }
+}
+
+static void free_sdu_frame(SDUFrame* frame)
+{
+    if (frame->type == FRAME_UNFRAGMENTED)
+    {
+        if (frame->data.unfragmented.sdu)
+            free(frame->data.unfragmented.sdu);
+    }
+    else if (frame->type == FRAME_FRAGMENTED)
+    {
+        if (frame->data.fragmented.sdu)
+            free(frame->data.fragmented.sdu);
+    }
+}
