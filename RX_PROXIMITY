@@ -22,7 +22,15 @@ static void receive_and_process(lr11xx_hal_context_t *context);
 static void free_sdu_frame(SDUFrame* frame);
 
 // Buffer estático para reensamblado
-static SerializedData reassembly_buffer = {0};
+//static SerializedData reassembly_buffer = {0};
+// Buffer real de almacenamiento (2KB suficiente para reensamblar varios paquetes grandes)
+static uint8_t reassembly_raw_storage[2048];
+
+// Estructura SerializedData apuntando al buffer real
+static SerializedData reassembly_buffer = { 
+    .data = reassembly_raw_storage, 
+    .length = 0 
+};
 
 int main(void)
 {
@@ -80,6 +88,12 @@ static void receive_and_process(lr11xx_hal_context_t *context)
 
 
         HAL_DBG_TRACE_INFO("RX: %d bytes | ", rx_size);
+
+        HAL_DBG_TRACE_PRINTF("Raw: ");
+        for (int i = 0; i < rx_size; i++) {
+            HAL_DBG_TRACE_PRINTF("%02X ", rx_buffer[i]);
+        }
+        HAL_DBG_TRACE_PRINTF("\n");
 
 
         /* ========= DESERIALIZAR FRAME ========= */
@@ -174,7 +188,9 @@ static void receive_and_process(lr11xx_hal_context_t *context)
                     HAL_DBG_TRACE_PRINTF("\n\n");
                     
                     // Limpiar buffer de reensamblado
-                    memset(reassembly_buffer.data, 0, sizeof(reassembly_buffer.data));
+                    //
+                     memset(reassembly_buffer.data, 0, sizeof(reassembly_raw_storage));
+                     //memset(reassembly_buffer.data, 0, sizeof(reassembly_buffer.data));
                     reassembly_buffer.length = 0;
                 }
             }
@@ -222,3 +238,6 @@ static void free_sdu_frame(SDUFrame* frame)
             free(frame->data.fragmented.sdu);
     }
 }
+
+
+
