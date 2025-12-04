@@ -9,6 +9,7 @@
 #include "apps_utilities.h"
 #include "lr11xx_radio.h"
 #include "lr11xx_regmem.h"
+#include "lr11xx_system.h"
 #include "smtc_hal_dbg_trace.h"
 #include "uart_init.h"
 
@@ -37,14 +38,28 @@ int main(void)
     apps_common_lr11xx_radio_init((void*) context);
 
     /* Example payload to send */
-    const uint8_t payload[] = "Hello from TX node FROM NANOSATLAB";
+    // const uint8_t payload[] = "Hello from TX node FROM NANOSATLAB";
    
   
    
-    const size_t payload_len = sizeof(payload) - 1;
-    HAL_DBG_TRACE_INFO("Full payload to send (len=%d): %s\n", (int)payload_len, payload);
+    // const size_t payload_len = sizeof(payload) - 1;
+   //  HAL_DBG_TRACE_INFO("Full payload to send (len=%d): %s\n", (int)payload_len, payload);
     // HAL_DBG_TRACE_INFO("Prepared payload to send (len=%d): %s\n", (int)payload_len, payload);
-    HAL_DBG_TRACE_INFO("Prepared payload to send (len=%d bytes, will fragment into 3 segments)\n", (int)payload_len);
+    // HAL_DBG_TRACE_INFO("Prepared payload to send (len=%d bytes, will fragment into 3 segments)\n", (int)payload_len);
+
+
+
+
+    static uint8_t payload[747];
+    const char* msg_pattern = "ESTE ES UN MENSAJE LARGO DE PRUEBA PARA VERIFICAR LA FRAGMENTACION EN 3 SEGMENTOS DE 249 BYTES CADA UNO. ";
+    size_t pattern_len = strlen(msg_pattern);
+
+    for(int i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)msg_pattern[i % pattern_len];
+    }
+   
+    const size_t payload_len = sizeof(payload);
+    HAL_DBG_TRACE_INFO("Full payload to send (len=%d bytes)\n", (int)payload_len);
 
     /* Optionally sleep or loop to send periodically */
     while (1) {
@@ -134,13 +149,23 @@ static void send_payload_autofrag(lr11xx_hal_context_t *context, const uint8_t *
         // Write the actual bytes and transmit
         ASSERT_LR11XX_RC( lr11xx_regmem_write_buffer8(context, serialized.data, serialized.length) );
         ASSERT_LR11XX_RC( lr11xx_radio_set_tx( context, 0 ) );
+        
+        // WAIT FOR TX DONE (Critical for fragmentation timing)
+        lr11xx_system_irq_mask_t irq_mask;
+        do {
+            ASSERT_LR11XX_RC(lr11xx_system_get_irq_status(context, &irq_mask));
+        } while ((irq_mask & LR11XX_SYSTEM_IRQ_TX_DONE) == 0);
+        ASSERT_LR11XX_RC(lr11xx_system_clear_irq_status(context, LR11XX_SYSTEM_IRQ_TX_DONE));
+
         HAL_DBG_TRACE_INFO("Segment sent over RF (%d bytes)\n", (int)serialized.length);
 
         // No free() needed - static buffer is reused
 
         // Delay entre segmentos: suficiente para que RX procese y vuelva a escuchar
-        LL_mDelay(500);  // 500ms entre segmentos
+        // Aumentado a 2000ms para asegurar que RX tiene tiempo de imprimir logs largos
+        LL_mDelay(2000);
     }
     // Clean buffer state
     free_buffer(&buffer, packet_id);
 }
+
