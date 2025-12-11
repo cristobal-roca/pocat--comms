@@ -50,15 +50,14 @@ int main(void)
 
 
 
-    static uint8_t payload[747];
-    const char* msg_pattern = "ESTE ES UN MENSAJE LARGO DE PRUEBA PARA VERIFICAR LA FRAGMENTACION EN 3 SEGMENTOS DE 249 BYTES CADA UNO. ";
-    size_t pattern_len = strlen(msg_pattern);
+    // Mensaje directo para generar 2 fragmentos: uno lleno (249) y otro parcial.
+    // Total aprox 330 bytes.
+    static const uint8_t payload[] = 
+        "Este es el packete 1 con rellenos de a: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEste es el packete 2 con rellenos de B: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBEste es el packete 3 con rellenos de C: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 
-    for(int i = 0; i < sizeof(payload); i++) {
-        payload[i] = (uint8_t)msg_pattern[i % pattern_len];
-    }
-   
-    const size_t payload_len = sizeof(payload);
+;
+
+    const size_t payload_len = sizeof(payload) - 1; // -1 para no enviar el '\0'
     HAL_DBG_TRACE_INFO("Full payload to send (len=%d bytes)\n", (int)payload_len);
 
     /* Optionally sleep or loop to send periodically */
